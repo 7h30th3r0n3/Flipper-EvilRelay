@@ -1,0 +1,26 @@
+# Flipper FAP build output
+dist/
+.ufbt/
+*.fap
+
+# ESP32 / arduino-cli build
+build/
+*.bin
+*.elf
+*.map
+
+# Android
+android-reader/src/.gradle/
+android-reader/src/build/
+android-reader/src/app/build/
+android-reader/src/local.properties
+android-reader/src/.idea/
+android-reader/src/*.iml
+*.apk
+# ...but keep the shipped reader APK
+!android-reader/EvilRelay-v1.8.apk
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp

@@ -1,0 +1,28 @@
+Flipper-EvilRelay
+Copyright (c) 2026 7h30th3r0n3
+
+This repository's own source code is licensed under the GNU General Public License
+version 3 or later (GPL-3.0-or-later; see LICENSE). Any redistributed version, modified
+or not, must remain open-source under the GPL and keep these copyright and attribution
+notices; modified versions must be marked as changed.
+
+Attribution and upstreams:
+
+- The relay design, protocol and reader side are ported from the author's own
+  Evil-M5Project (https://github.com/7h30th3r0n3/Evil-M5Project), to the extent this
+  ported code is the author's own work.
+
+- The Flipper FAP is built against the Flipper Zero firmware SDK and the Momentum
+  (mntm) firmware SDK. It calls the firmware's NFC listener APIs (iso14443_3a_listener
+  and related). The Flipper Zero firmware is licensed under the GNU General Public
+  License v3.0, the same license as this project, so the compiled .fap and its source
+  are consistently GPLv3. If you distribute a compiled .fap (for example in a GitHub
+  Release), the corresponding source is this repository at the matching commit, which
+  satisfies GPLv3's source-availability requirement.
+
+- The ESP32 bridge uses the Espressif Arduino-ESP32 core (WiFi, esp_now, esp_wifi).
+
+- The Android reader uses the Android SDK and AndroidX / Material Components libraries.
+
+No warranty. Use only on cards, readers and terminals you own or are authorised to
+test. See docs/legal.md.
