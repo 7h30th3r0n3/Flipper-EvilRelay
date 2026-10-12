@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 7h30th3r0n3. Part of Flipper-EvilRelay: https://github.com/7h30th3r0n3/Flipper-EvilRelay
-// EvilRelayESP32: transport bridge for the EvilRelay Flipper FAP.
+// EvilRelayESP32 — transport bridge for the EvilRelay Flipper FAP.
 //
 // Role: this ESP32 is cabled to the Flipper's USART (GPIO 13=TX / 14=RX) and
 // bridges that UART to the air side, carrying the EvilRelay frame protocol so a
@@ -15,15 +15,10 @@
 // Both transports run at once; whichever reader is active feeds the Flipper.
 // Outbound REQ prefers a connected TCP client, else broadcasts over ESP-NOW.
 //
-// Wiring (4 pins, 3.3 V both sides, no level shifter). The board is laid out to
-// plug straight onto the Flipper header: UART on GPIO0/GPIO1, 3V3 on the standard
-// power pin, and the ground picked up at the GPIO3 position (the Flipper GND lines
-// up there), so a short jumper ties the C3 GPIO3 pad to the C3 GND. Leave GPIO3
-// unused in code so nothing drives it against ground.
-//   Flipper pin 13 (TX)  -> ESP32 GPIO1  (UART_RX_PIN)
-//   Flipper pin 14 (RX)  -> ESP32 GPIO0  (UART_TX_PIN)
-//   Flipper pin  9 (3V3) -> ESP32 3V3    (standard power pin)
-//   Flipper GND          -> ESP32 GND    (via jumper C3 GPIO3 <-> C3 GND; GND sits at the GPIO3 position)
+// Wiring (3.3 V both sides, no level shifter):
+//   Flipper pin 13 (TX)  -> ESP32 UART_RX_PIN
+//   Flipper pin 14 (RX)  -> ESP32 UART_TX_PIN
+//   Flipper GND          -> ESP32 GND
 //
 // Frame protocol
 //   UART / TCP : [0x5A][type][seq][lenHi][lenLo][payload]            (one frame = one message)
@@ -83,10 +78,10 @@ WiFiClient tcpClient;
 static uint8_t  bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 static bool     espnowPeerSeen = false;
 
-// ESP-NOW reassembly (one message in flight, half-duplex, like the Evil fw).
+// ESP-NOW reassembly (one message in flight — half-duplex, like the Evil fw).
 static uint8_t  asmBuf[1024];
 static uint8_t  asmSeq = 0, asmType = 0, asmTotal = 0;
-static uint32_t asmMask = 0;              // bitmask of received fragment indices (not a count)
+static uint32_t asmMask = 0;              // bitmask of received fragment indices
 static uint16_t asmLen = 0;
 static volatile bool espnowMsgReady = false;
 static uint8_t  espnowMsgType = 0, espnowMsgSeq = 0;
@@ -171,13 +166,15 @@ static void onEspnowRecv(const uint8_t* mac, const uint8_t* data, int len) {
   if(fidx < 32 && !(asmMask & (1u << fidx)) && off + plen <= sizeof(asmBuf)) {
     memcpy(asmBuf + off, data + 6, plen);
     if(off + plen > asmLen) asmLen = off + plen;
-    asmMask |= (1u << fidx);             // count distinct fragments, not packets (dup-safe)
+    asmMask |= (1u << fidx);             // count distinct fragments, not packets
   }
   uint32_t full = (asmTotal >= 32) ? 0xFFFFFFFFu : ((1u << asmTotal) - 1u);
-  if(asmTotal > 0 && asmMask == full) {  // all distinct fragments present -> hand to main loop
-    espnowMsgType = type; espnowMsgSeq = seq; espnowMsgLen = asmLen;
-    memcpy(espnowMsg, asmBuf, asmLen);
-    espnowMsgReady = true;
+  if(asmTotal > 0 && asmMask == full) {  // all fragments present -> hand to main loop
+    if(!espnowMsgReady) {                // don't clobber a message the loop hasn't sent
+      espnowMsgType = type; espnowMsgSeq = seq; espnowMsgLen = asmLen;
+      memcpy(espnowMsg, asmBuf, asmLen);
+      espnowMsgReady = true;
+    }
     asmSeq = (uint8_t)(seq + 1); asmMask = 0;  // force next to look new
   }
 }
@@ -270,7 +267,7 @@ void setup() {
   Serial.print("[ap] SSID "); Serial.print(AP_SSID);
   Serial.print("  IP "); Serial.print(WiFi.softAPIP());
   Serial.print("  TCP "); Serial.println(TCP_PORT);
-  Serial.println("[bridge] ready. reader: phone(WiFi) or Evil-A(ESP-NOW) -> Flipper UART");
+  Serial.println("[bridge] ready — reader: phone(WiFi) or Evil-A(ESP-NOW) -> Flipper UART");
   sendStatusToFlipper(RLY_ST_BRIDGE_UP);   // tell the Flipper the bridge is alive
 }
 
@@ -278,9 +275,14 @@ void loop() {
   pumpUart();
   pumpTcp();
   if(espnowMsgReady) {
-    espnowMsgReady = false;
-    trace("espnow->flip", espnowMsgType, espnowMsgSeq, espnowMsgLen);     // IDENT / RESP -> Flipper
-    sendToFlipper(espnowMsgType, espnowMsgSeq, espnowMsg, espnowMsgLen);
+    static uint8_t out[1024];
+    uint8_t  t = espnowMsgType, s = espnowMsgSeq;
+    uint16_t l = espnowMsgLen;
+    if(l > sizeof(out)) l = sizeof(out);
+    memcpy(out, espnowMsg, l);           // copy out before releasing the buffer
+    espnowMsgReady = false;              // now the recv callback may fill it again
+    trace("espnow->flip", t, s, l);      // IDENT / RESP -> Flipper
+    sendToFlipper(t, s, out, l);
   }
 
   // Step-feedback to the Flipper screen: ~1 s bridge heartbeat, plus one-shot

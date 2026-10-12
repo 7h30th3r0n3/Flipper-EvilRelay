@@ -24,7 +24,7 @@
 
 // Time the ISO-DEP listener waits (blocking the NFC thread, inside the callback)
 // for the card response relayed back over UART. The forged ATS advertises FWI=14
-// (FWT ~4.9 s) so the reader waits that long for each block; stay under it.
+// (FWT ~4.9 s) so the reader waits that long for each block — stay under it.
 #define RELAY_RESP_TIMEOUT_MS 3000
 
 // ISO-DEP PCB bits (ISO 14443-4).
@@ -59,6 +59,7 @@ static uint8_t g_resp[520]; // card response from the phone
 static volatile uint16_t g_resp_len = 0;
 static uint8_t g_cmd[600]; // reassembled reader command (APDU)
 static uint16_t g_cmd_len = 0;
+static bool g_cmd_ovf = false; // a fragment overflowed g_cmd: don't relay a partial APDU
 
 // Outbound response-chaining progress.
 static uint16_t g_chain_off = 0;
@@ -70,6 +71,11 @@ static RelayState g_state = ST_IDLE;
 static volatile uint32_t g_apdu = 0;
 static volatile bool g_emul = false;
 static uint8_t g_seq = 0;
+// Sequence of the REQ currently awaiting a RESP. A RESP whose seq does not match
+// (e.g. a late response to a command we already timed out on) is dropped, so it
+// cannot be mistaken for the answer to the next command. The reader echoes the
+// REQ seq in its RESP (the bundled Android app and the Evil reader both do).
+static uint8_t g_inflight_seq = 0;
 static uint8_t g_last_ident[72];
 static uint16_t g_last_ident_len = 0;
 
@@ -145,7 +151,8 @@ static void service_command(Iso14443_3aListener* inst, uint8_t bn, int cid) {
     } // drain stale token
     g_resp_len = 0;
     uint32_t t0 = furi_get_tick();
-    relay_uart_tx_frame(F_REQ, g_seq++, g_cmd, g_cmd_len);
+    g_inflight_seq = g_seq++;
+    relay_uart_tx_frame(F_REQ, g_inflight_seq, g_cmd, g_cmd_len);
     bool got = (furi_semaphore_acquire(g_resp_sem, RELAY_RESP_TIMEOUT_MS) == FuriStatusOk);
     uint32_t rtt = furi_get_tick() - t0;
     g_last_rtt = rtt;
@@ -223,10 +230,15 @@ static NfcCommand relay_nfc_cb(NfcGenericEvent event, void* ctx) {
             uint8_t bn = pcb & 0x01;
             uint16_t plen = (rxlen > (size_t)off) ? (uint16_t)(rxlen - off) : 0;
 
-            if(g_state != ST_RECV_CMD) g_cmd_len = 0; // first fragment of a command
+            if(g_state != ST_RECV_CMD) { // first fragment of a command
+                g_cmd_len = 0;
+                g_cmd_ovf = false;
+            }
             if((uint32_t)g_cmd_len + plen <= sizeof(g_cmd)) {
                 memcpy(g_cmd + g_cmd_len, rx + off, plen);
                 g_cmd_len += plen;
+            } else {
+                g_cmd_ovf = true; // too large to hold: do not relay a truncated APDU
             }
             if(pcb & PCB_CHAINING) { // reader-chained command: ACK and await more
                 uint8_t rack = (uint8_t)(0xA2 | bn);
@@ -235,6 +247,17 @@ static NfcCommand relay_nfc_cb(NfcGenericEvent event, void* ctx) {
                 return NfcCommandContinue;
             }
             g_state = ST_ACTIVE; // command complete
+            if(g_cmd_ovf) { // oversize command: answer 6F00 rather than a partial APDU
+                g_resp[0] = 0x6F;
+                g_resp[1] = 0x00;
+                g_resp_len = 2;
+                g_chain_off = 0;
+                g_chain_idx = 0;
+                g_chain_bn = bn;
+                g_chain_cid = cid;
+                send_resp_chunk(inst);
+                return NfcCommandContinue;
+            }
             service_command(inst, bn, cid);
             return NfcCommandContinue;
         }
@@ -295,7 +318,7 @@ static void relay_nfc_restart_listener(
 }
 
 // A relay frame arrived from the ESP32 over UART (worker-thread context).
-void relay_nfc_on_frame(uint8_t type, const uint8_t* data, uint16_t len, void* ctx) {
+void relay_nfc_on_frame(uint8_t type, uint8_t seq, const uint8_t* data, uint16_t len, void* ctx) {
     UNUSED(ctx);
     if(type == F_IDENT) {
         // [uidLen][uid..][atqa0][atqa1][sak][atsLen][ats..]
@@ -340,12 +363,6 @@ void relay_nfc_on_frame(uint8_t type, const uint8_t* data, uint16_t len, void* c
             *w = 0;
         }
         relay_nfc_restart_listener(uid, uidlen, atqa, sak, ats, atslen);
-    } else if(type == F_RESP) {
-        uint16_t n = len;
-        if(n > sizeof(g_resp)) n = sizeof(g_resp);
-        memcpy(g_resp, data, n);
-        g_resp_len = n;
-        furi_semaphore_release(g_resp_sem);
     } else if(type == F_STATUS) {
         // Bridge step-feedback: refresh liveness, track the reader link.
         if(len >= 1) {
@@ -357,6 +374,18 @@ void relay_nfc_on_frame(uint8_t type, const uint8_t* data, uint16_t len, void* c
                 g_reader_state = 0;
             // ST_BRIDGE_UP is a heartbeat only (g_bridge_tick already refreshed).
         }
+    } else if(type == F_RESP) {
+        if(seq != g_inflight_seq) {
+            // Stale/mismatched response (e.g. a late answer to a timed-out command).
+            // Dropping it stops it being served as the answer to the next command.
+            FURI_LOG_W(TAG, "drop RESP seq=%u (want %u)", seq, g_inflight_seq);
+            return;
+        }
+        uint16_t n = len;
+        if(n > sizeof(g_resp)) n = sizeof(g_resp);
+        memcpy(g_resp, data, n);
+        g_resp_len = n;
+        furi_semaphore_release(g_resp_sem);
     }
 }
 

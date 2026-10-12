@@ -19,7 +19,7 @@ void relay_nfc_start(void);
 void relay_nfc_stop(void);
 
 // RelayUartRxCallback: a decoded relay frame (IDENT or RESP) from the ESP32.
-void relay_nfc_on_frame(uint8_t type, const uint8_t* data, uint16_t len, void* ctx);
+void relay_nfc_on_frame(uint8_t type, uint8_t seq, const uint8_t* data, uint16_t len, void* ctx);
 
 bool relay_nfc_emulating(void);
 uint32_t relay_nfc_apdu_count(void);

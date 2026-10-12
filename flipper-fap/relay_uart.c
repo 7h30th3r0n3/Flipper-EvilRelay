@@ -10,12 +10,11 @@
 #define TAG "RelayUart"
 #define F_MAGIC 0x5A
 
-// Relay frame: [0x5A][type][seq][lenHi][lenLo][payload].
+// Relay frame: [0x5A][type][seq][lenHi][lenLo][payload], payload <= 256.
 #define RELAY_HDR_LEN 5
-// Receive-side cap: large enough to accept any normal card response without dropping
-// it as "bogus length" and desynchronising the stream. The NFC side returns the
-// response to the reader split across as many chained I-blocks as the reader's FSD
-// needs (see relay_nfc.c), so this cap is just the per-response reassembly ceiling.
+// Receive-side cap: large enough to accept any card response without dropping it
+// as "bogus length" and desynchronising the stream. The NFC side separately caps
+// what it can actually emit to the terminal (single I-block, 256 bytes).
 #define RELAY_PAYLOAD_MAX 512
 #define RELAY_FRAME_MAX (RELAY_HDR_LEN + RELAY_PAYLOAD_MAX)
 #define RX_STREAM_SIZE 1024
@@ -82,7 +81,7 @@ static int32_t relay_uart_worker(void* ctx) {
             continue;
         }
         if(have >= RELAY_HDR_LEN && have == (size_t)(RELAY_HDR_LEN + need_payload)) {
-            if(g_cb) g_cb(frame[1], frame + RELAY_HDR_LEN, need_payload, g_cb_ctx);
+            if(g_cb) g_cb(frame[1], frame[2], frame + RELAY_HDR_LEN, need_payload, g_cb_ctx);
             have = 0;
             need_payload = 0;
         }
@@ -136,7 +135,7 @@ bool relay_uart_start(uint32_t baud, RelayUartRxCallback callback, void* context
     g_rx_stream = furi_stream_buffer_alloc(RX_STREAM_SIZE, 1);
     g_running = true;
     // Generous stack: the RX callback starts the NFC listener (set_uid, ATS fill,
-    // nfc_listener_alloc/start) from this thread, deep call chains that overflow a
+    // nfc_listener_alloc/start) from this thread — deep call chains that overflow a
     // small stack and trip the stack-canary furi_check (freeze on first IDENT).
     g_worker = furi_thread_alloc_ex("RelayUartRx", 16384, relay_uart_worker, NULL);
     furi_thread_start(g_worker);

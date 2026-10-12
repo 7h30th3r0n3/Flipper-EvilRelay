@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 7h30th3r0n3. Part of Flipper-EvilRelay: https://github.com/7h30th3r0n3/Flipper-EvilRelay
-// EvilRelay (Flipper): ISO-DEP emulator half of the NFC relay.
+// EvilRelay (Flipper) — ISO-DEP emulator half of the NFC relay.
 // The Flipper emulates an ISO14443-4 card to the terminal (TPE) and relays the
 // application APDUs over its USART (pins 13=TX / 14=RX) to a companion ESP32.
-// The ESP32 bridges that UART to the air side (a phone over Wi-Fi/TCP, or an
-// Evil reader unit over ESP-NOW), which reads the real card and returns the
+// The ESP32 bridges that UART to the air side — a phone over Wi-Fi/TCP, or an
+// Evil reader unit over ESP-NOW — which reads the real card and returns the
 // responses. Same relay frame protocol ([0x5A]...) runs end to end.
 #include <furi.h>
 #include <gui/gui.h>
@@ -84,7 +84,6 @@ static void draw_status_view(Canvas* c, RelayState* st) {
     const char* rtxt = (rs == 2) ? "Wi-Fi" : (rs == 3) ? "ESP-NOW" : emul ? "linked" : "waiting";
     char uidv[20];
     if(card_ok) {
-        // trim a long UID so the value column always fits the screen width
         snprintf(uidv, sizeof(uidv), "%.14s%s", uid, (uid[14] != 0) ? "~" : "");
     } else {
         snprintf(uidv, sizeof(uidv), "waiting");

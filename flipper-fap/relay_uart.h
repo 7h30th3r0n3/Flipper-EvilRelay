@@ -18,7 +18,9 @@
 #include <stdbool.h>
 
 // Invoked in worker-thread context once a full relay frame has been reassembled.
-typedef void (*RelayUartRxCallback)(uint8_t type, const uint8_t* data, uint16_t len, void* context);
+// seq is the frame's sequence byte, used to match a RESP to its REQ.
+typedef void (*RelayUartRxCallback)(
+    uint8_t type, uint8_t seq, const uint8_t* data, uint16_t len, void* context);
 
 // Acquire the USART, start RX reassembly. Returns false if the bus is busy.
 bool relay_uart_start(uint32_t baud, RelayUartRxCallback callback, void* context);
