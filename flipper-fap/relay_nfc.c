@@ -14,6 +14,13 @@
 #define F_IDENT 1
 #define F_REQ 2
 #define F_RESP 3
+#define F_STATUS 4
+
+// STATUS codes from the ESP32 bridge (match EvilRelayESP32.ino RLY_ST_*).
+#define ST_BRIDGE_UP 0x01
+#define ST_READER_WIFI 0x02
+#define ST_READER_NOW 0x03
+#define ST_READER_LOST 0x04
 
 // Time the ISO-DEP listener waits (blocking the NFC thread, inside the callback)
 // for the card response relayed back over UART. The forged ATS advertises FWI=14
@@ -66,11 +73,29 @@ static uint8_t g_seq = 0;
 static uint8_t g_last_ident[72];
 static uint16_t g_last_ident_len = 0;
 
+// Step-feedback state (shown on the Flipper screen).
+static volatile uint32_t g_bridge_tick = 0; // last STATUS frame tick (0 = never)
+static volatile uint8_t g_reader_state = 0; // 0 none, 2 Wi-Fi, 3 ESP-NOW
+static char g_uid_str[32] = ""; // emulated card UID as hex
+static volatile uint32_t g_last_rtt = 0; // last APDU round-trip (ms)
+
 bool relay_nfc_emulating(void) {
     return g_emul;
 }
 uint32_t relay_nfc_apdu_count(void) {
     return g_apdu;
+}
+bool relay_nfc_bridge_alive(void) {
+    return g_bridge_tick != 0 && (furi_get_tick() - g_bridge_tick) < 3000;
+}
+uint8_t relay_nfc_reader_state(void) {
+    return g_reader_state;
+}
+const char* relay_nfc_uid_str(void) {
+    return g_uid_str;
+}
+uint32_t relay_nfc_last_rtt(void) {
+    return g_last_rtt;
 }
 
 // FSDI -> FSD (max frame bytes the reader accepts), ISO 14443-4 table.
@@ -123,6 +148,7 @@ static void service_command(Iso14443_3aListener* inst, uint8_t bn, int cid) {
     relay_uart_tx_frame(F_REQ, g_seq++, g_cmd, g_cmd_len);
     bool got = (furi_semaphore_acquire(g_resp_sem, RELAY_RESP_TIMEOUT_MS) == FuriStatusOk);
     uint32_t rtt = furi_get_tick() - t0;
+    g_last_rtt = rtt;
 
     if(!got || g_resp_len == 0) {
         g_resp[0] = 0x6F; // SW 6F00: generic failure, lets the reader move on cleanly
@@ -302,6 +328,17 @@ void relay_nfc_on_frame(uint8_t type, const uint8_t* data, uint16_t len, void* c
         } else {
             g_last_ident_len = 0;
         }
+        // Capture the UID as hex for the on-screen "Card" step.
+        {
+            static const char hx[] = "0123456789ABCDEF";
+            int n = uidlen > 10 ? 10 : uidlen;
+            char* w = g_uid_str;
+            for(int i = 0; i < n && (w - g_uid_str) < (int)sizeof(g_uid_str) - 3; i++) {
+                *w++ = hx[uid[i] >> 4];
+                *w++ = hx[uid[i] & 0x0F];
+            }
+            *w = 0;
+        }
         relay_nfc_restart_listener(uid, uidlen, atqa, sak, ats, atslen);
     } else if(type == F_RESP) {
         uint16_t n = len;
@@ -309,6 +346,17 @@ void relay_nfc_on_frame(uint8_t type, const uint8_t* data, uint16_t len, void* c
         memcpy(g_resp, data, n);
         g_resp_len = n;
         furi_semaphore_release(g_resp_sem);
+    } else if(type == F_STATUS) {
+        // Bridge step-feedback: refresh liveness, track the reader link.
+        if(len >= 1) {
+            g_bridge_tick = furi_get_tick();
+            uint8_t code = data[0];
+            if(code == ST_READER_WIFI || code == ST_READER_NOW)
+                g_reader_state = code;
+            else if(code == ST_READER_LOST)
+                g_reader_state = 0;
+            // ST_BRIDGE_UP is a heartbeat only (g_bridge_tick already refreshed).
+        }
     }
 }
 
@@ -320,6 +368,10 @@ void relay_nfc_start(void) {
     g_state = ST_IDLE;
     g_cmd_len = 0;
     g_last_ident_len = 0;
+    g_bridge_tick = 0;
+    g_reader_state = 0;
+    g_uid_str[0] = 0;
+    g_last_rtt = 0;
     if(!g_nfc) g_nfc = nfc_alloc();
     if(!g_resp_sem) g_resp_sem = furi_semaphore_alloc(1, 0);
     if(!g_txbuf) g_txbuf = bit_buffer_alloc(272);

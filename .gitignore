@@ -24,3 +24,7 @@ android-reader/src/*.iml
 .DS_Store
 Thumbs.db
 *.swp
+
+# ufbt IDE artifacts
+flipper-fap/.vscode/
+flipper-fap/dist/

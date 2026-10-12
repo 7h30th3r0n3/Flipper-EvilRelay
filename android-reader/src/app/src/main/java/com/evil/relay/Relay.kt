@@ -56,7 +56,12 @@ object Relay {
     private fun readN(inp: InputStream, n: Int): ByteArray? {
         val b = ByteArray(n); var r = 0
         while (r < n) {
-            val k = try { inp.read(b, r, n - r) } catch (e: Exception) { return null }
+            // Let a read timeout propagate so a persistent reader can poll for a new
+            // card between frames; any other error (close/reset) means the socket is
+            // dead -> null. Callers that set no soTimeout never see the timeout.
+            val k = try { inp.read(b, r, n - r) }
+                    catch (t: java.net.SocketTimeoutException) { throw t }
+                    catch (e: Exception) { return null }
             if (k < 0) return null
             r += k
         }

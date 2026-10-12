@@ -11,6 +11,7 @@
 //   type 1 IDENT  reader->Flipper : [uidLen][uid..][atqa0][atqa1][sak][atsLen][ats..]
 //   type 2 REQ    Flipper->reader : application APDU from the terminal
 //   type 3 RESP   reader->Flipper : card response
+//   type 4 STATUS bridge->Flipper : [code]  (step feedback; see relay_nfc.c)
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -22,3 +23,9 @@ void relay_nfc_on_frame(uint8_t type, const uint8_t* data, uint16_t len, void* c
 
 bool relay_nfc_emulating(void);
 uint32_t relay_nfc_apdu_count(void);
+
+// Step-feedback for the UI (from ESP32 STATUS frames + the card IDENT).
+bool relay_nfc_bridge_alive(void); // ESP32 bridge heartbeat seen in the last ~3 s
+uint8_t relay_nfc_reader_state(void); // 0 none, 2 Wi-Fi reader, 3 ESP-NOW reader
+const char* relay_nfc_uid_str(void); // emulated card UID as hex, or "" if none
+uint32_t relay_nfc_last_rtt(void); // last APDU round-trip in ms (0 if none yet)

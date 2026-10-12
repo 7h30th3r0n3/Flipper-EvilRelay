@@ -53,14 +53,21 @@ static const uint16_t TCP_PORT = 5566;
 #define RLY_T_IDENT 1
 #define RLY_T_REQ   2
 #define RLY_T_RESP  3
+#define RLY_T_STATUS 4             // bridge->Flipper: link/reader status (step feedback)
 #define RLY_CHUNK   230              // ESP-NOW payload per fragment (Evil RLY_CHUNK)
+
+// STATUS payload (1 byte) — lets the Flipper show the relay chain step by step.
+#define RLY_ST_BRIDGE_UP    0x01     // heartbeat: this ESP32 bridge is alive
+#define RLY_ST_READER_WIFI  0x02     // a phone reader connected over Wi-Fi/TCP
+#define RLY_ST_READER_NOW   0x03     // an Evil reader unit appeared over ESP-NOW
+#define RLY_ST_READER_LOST  0x04     // the connected reader went away
 
 #define PAYLOAD_MAX 512
 #define UART_FRAME_MAX (5 + PAYLOAD_MAX)
 
 #define RLY_TRACE 0                  // 1 = print frame flow on USB serial (bring-up)
 static const char* typeName(uint8_t t){
-  switch(t){ case RLY_T_IDENT:return "IDENT"; case RLY_T_REQ:return "REQ"; case RLY_T_RESP:return "RESP"; default:return "?"; }
+  switch(t){ case RLY_T_IDENT:return "IDENT"; case RLY_T_REQ:return "REQ"; case RLY_T_RESP:return "RESP"; case RLY_T_STATUS:return "STATUS"; default:return "?"; }
 }
 static void trace(const char* dir, uint8_t type, uint8_t seq, uint16_t len){
 #if RLY_TRACE
@@ -78,7 +85,8 @@ static bool     espnowPeerSeen = false;
 
 // ESP-NOW reassembly (one message in flight, half-duplex, like the Evil fw).
 static uint8_t  asmBuf[1024];
-static uint8_t  asmSeq = 0, asmType = 0, asmTotal = 0, asmHave = 0;
+static uint8_t  asmSeq = 0, asmType = 0, asmTotal = 0;
+static uint32_t asmMask = 0;              // bitmask of received fragment indices (not a count)
 static uint16_t asmLen = 0;
 static volatile bool espnowMsgReady = false;
 static uint8_t  espnowMsgType = 0, espnowMsgSeq = 0;
@@ -99,6 +107,13 @@ static void sendToFlipper(uint8_t type, uint8_t seq, const uint8_t* p, uint16_t 
   FLIPPER_UART.write(hdr, 5);
   if(len) FLIPPER_UART.write(p, len);
   FLIPPER_UART.flush();
+}
+
+// One-byte STATUS frame to the Flipper, so its screen can show the relay chain
+// step by step (bridge up / reader connected / reader lost). Harmless to an older
+// FAP that ignores unknown frame types.
+static void sendStatusToFlipper(uint8_t code) {
+  sendToFlipper(RLY_T_STATUS, outSeq++, &code, 1);
 }
 
 static void sendToTcp(uint8_t type, uint8_t seq, const uint8_t* p, uint16_t len) {
@@ -150,19 +165,20 @@ static void onEspnowRecv(const uint8_t* mac, const uint8_t* data, int len) {
   espnowPeerSeen = true;
 
   if(seq != asmSeq || type != asmType) {  // new message
-    asmSeq = seq; asmType = type; asmTotal = ftot; asmHave = 0; asmLen = 0;
+    asmSeq = seq; asmType = type; asmTotal = ftot; asmMask = 0; asmLen = 0;
   }
   uint16_t off = (uint16_t)fidx * RLY_CHUNK;
-  if(off + plen <= sizeof(asmBuf)) {
+  if(fidx < 32 && !(asmMask & (1u << fidx)) && off + plen <= sizeof(asmBuf)) {
     memcpy(asmBuf + off, data + 6, plen);
     if(off + plen > asmLen) asmLen = off + plen;
-    asmHave++;
+    asmMask |= (1u << fidx);             // count distinct fragments, not packets (dup-safe)
   }
-  if(asmHave >= asmTotal) {              // complete -> hand to main loop
+  uint32_t full = (asmTotal >= 32) ? 0xFFFFFFFFu : ((1u << asmTotal) - 1u);
+  if(asmTotal > 0 && asmMask == full) {  // all distinct fragments present -> hand to main loop
     espnowMsgType = type; espnowMsgSeq = seq; espnowMsgLen = asmLen;
     memcpy(espnowMsg, asmBuf, asmLen);
     espnowMsgReady = true;
-    asmSeq = (uint8_t)(seq + 1); asmHave = 0;  // force next to look new
+    asmSeq = (uint8_t)(seq + 1); asmMask = 0;  // force next to look new
   }
 }
 
@@ -202,6 +218,7 @@ static void pumpTcp() {
       tcpClient.setNoDelay(true);
       tcpHave = 0; tcpNeed = 0;
       Serial.println("[tcp] phone reader connected");
+      sendStatusToFlipper(RLY_ST_READER_WIFI);
     }
     return;
   }
@@ -254,6 +271,7 @@ void setup() {
   Serial.print("  IP "); Serial.print(WiFi.softAPIP());
   Serial.print("  TCP "); Serial.println(TCP_PORT);
   Serial.println("[bridge] ready. reader: phone(WiFi) or Evil-A(ESP-NOW) -> Flipper UART");
+  sendStatusToFlipper(RLY_ST_BRIDGE_UP);   // tell the Flipper the bridge is alive
 }
 
 void loop() {
@@ -264,4 +282,16 @@ void loop() {
     trace("espnow->flip", espnowMsgType, espnowMsgSeq, espnowMsgLen);     // IDENT / RESP -> Flipper
     sendToFlipper(espnowMsgType, espnowMsgSeq, espnowMsg, espnowMsgLen);
   }
+
+  // Step-feedback to the Flipper screen: ~1 s bridge heartbeat, plus one-shot
+  // notices when a reader appears (Wi-Fi handled in pumpTcp) or drops.
+  static uint32_t lastHb = 0;
+  static bool espnowReported = false;
+  static bool tcpWasUp = false;
+  uint32_t now = millis();
+  if(now - lastHb >= 1000) { lastHb = now; sendStatusToFlipper(RLY_ST_BRIDGE_UP); }
+  if(espnowPeerSeen && !espnowReported) { espnowReported = true; sendStatusToFlipper(RLY_ST_READER_NOW); }
+  bool tcpUp = (tcpClient && tcpClient.connected());
+  if(tcpWasUp && !tcpUp) sendStatusToFlipper(RLY_ST_READER_LOST);
+  tcpWasUp = tcpUp;
 }

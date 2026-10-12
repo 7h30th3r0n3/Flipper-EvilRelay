@@ -8,4 +8,5 @@ App(
     fap_icon="evil_relay.png",
     fap_description="ISO-DEP NFC relay emulator; APDUs bridged over UART to a companion ESP32 (Wi-Fi/ESP-NOW)",
     fap_author="7h30th3r0n3",
+    fap_version=(1, 1),
 )
