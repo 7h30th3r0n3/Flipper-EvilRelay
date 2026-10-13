@@ -35,8 +35,8 @@
 // Target board: ESP32-C3. Pins below are C3-safe (not strapping/USB/UART0/flash).
 // On a classic ESP32 use e.g. 16/17 instead; on an S3 pick any free GPIOs.
 #define UART_BAUD    115200          // must match the FAP (RELAY_UART_BAUD)
-#define UART_RX_PIN  1               // <- Flipper pin 13 (TX)   [C3 GPIO1]
-#define UART_TX_PIN  0               // <- Flipper pin 14 (RX)   [C3 GPIO0]
+#define UART_RX_PIN  44               // <- Flipper pin 13 (TX)   [C3 GPIO1]
+#define UART_TX_PIN  43               // <- Flipper pin 14 (RX)   [C3 GPIO0]
 #define FLIPPER_UART Serial1
 
 static const char* AP_SSID = "EvilRelay";       // same as the Evil firmware
