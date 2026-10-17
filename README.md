@@ -328,7 +328,7 @@ The port is `/dev/ttyACM0` on Linux, `COMx` on Windows, `/dev/cu.usbmodem*` on m
 
 ### Android reader
 
-A prebuilt `android-reader/EvilRelay-v1.8.apk` is included (debug-signed; allow install from unknown apps). Copy it to the phone and install it. To build from source, open `android-reader/src/` in Android Studio, or run `./gradlew assembleDebug` there.
+A prebuilt `android-reader/EvilRelay-v1.12.apk` is included (debug-signed; allow install from unknown apps). Copy it to the phone and install it. To build from source, open `android-reader/src/` in Android Studio, or run `./gradlew assembleDebug` there.
 
 ---
 
@@ -368,7 +368,7 @@ Flipper-EvilRelay/
 ├── esp32-bridge/           the transport bridge
 │   └── EvilRelayESP32.ino  SoftAP + TCP 5566 and ESP-NOW ch.1 to Flipper UART 115200
 ├── android-reader/         the reader
-│   ├── EvilRelay-v1.8.apk  prebuilt APK
+│   ├── EvilRelay-v1.12.apk  prebuilt APK
 │   └── src/                Android/Kotlin source
 ├── docs/                   wiring, build, legal
 └── images/

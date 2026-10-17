@@ -11,8 +11,8 @@ android {
         applicationId "com.evil.relay"
         minSdk 21
         targetSdk 34
-        versionCode 9
-        versionName "1.8"
+        versionCode 13
+        versionName "1.12"
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17

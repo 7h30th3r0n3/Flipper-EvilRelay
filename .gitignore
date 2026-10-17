@@ -18,7 +18,7 @@ android-reader/src/.idea/
 android-reader/src/*.iml
 *.apk
 # ...but keep the shipped reader APK
-!android-reader/EvilRelay-v1.8.apk
+!android-reader/EvilRelay-v1.12.apk
 
 # OS / editor
 .DS_Store

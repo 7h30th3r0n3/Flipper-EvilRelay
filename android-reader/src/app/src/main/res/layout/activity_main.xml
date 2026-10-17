@@ -42,6 +42,7 @@
                     android:letterSpacing="0.02" />
 
                 <TextView
+                    android:id="@+id/subtitle"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="NFC relay - reader side"
@@ -118,6 +119,15 @@
                         android:text="Emulator"
                         android:textColor="@color/text"
                         android:buttonTint="@color/accent" />
+
+                    <RadioButton
+                        android:id="@+id/roleEmvInfo"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="EMV Info"
+                        android:textColor="@color/text"
+                        android:buttonTint="@color/accent" />
                 </RadioGroup>
 
                 <androidx.appcompat.widget.SwitchCompat
@@ -164,8 +174,117 @@
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
-        <!-- Card info -->
+        <!-- EMV card (shown only in EMV Info mode) -->
+        <LinearLayout
+            android:id="@+id/emvPanel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone"
+            android:layout_marginBottom="14dp"
+            android:background="@drawable/emv_card_bg"
+            android:padding="20dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+
+                <View
+                    android:layout_width="34dp"
+                    android:layout_height="26dp"
+                    android:background="@drawable/emv_chip" />
+
+                <View
+                    android:layout_width="0dp"
+                    android:layout_height="1dp"
+                    android:layout_weight="1" />
+
+                <TextView
+                    android:id="@+id/emvScheme"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:background="@drawable/chip_bg"
+                    android:paddingHorizontal="12dp"
+                    android:paddingVertical="5dp"
+                    android:text="EMV"
+                    android:textColor="@color/bg"
+                    android:textSize="13sp"
+                    android:textStyle="bold"
+                    android:letterSpacing="0.05" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/emvPan"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="22dp"
+                android:text="----  ----  ----  ----"
+                android:textColor="@color/text"
+                android:textSize="23sp"
+                android:fontFamily="monospace"
+                android:letterSpacing="0.08" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:layout_marginTop="20dp">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="CARDHOLDER"
+                        android:textColor="@color/text_dim"
+                        android:textSize="10sp"
+                        android:letterSpacing="0.12" />
+
+                    <TextView
+                        android:id="@+id/emvName"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="-"
+                        android:textColor="@color/text"
+                        android:textSize="15sp"
+                        android:fontFamily="monospace" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:gravity="end">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="VALID THRU"
+                        android:textColor="@color/text_dim"
+                        android:textSize="10sp"
+                        android:letterSpacing="0.12" />
+
+                    <TextView
+                        android:id="@+id/emvExp"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="--/--"
+                        android:textColor="@color/text"
+                        android:textSize="15sp"
+                        android:fontFamily="monospace" />
+                </LinearLayout>
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- Card info (relay) -->
         <com.google.android.material.card.MaterialCardView
+            android:id="@+id/relayPanel"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginBottom="14dp"
@@ -249,6 +368,7 @@
                 android:padding="18dp">
 
                 <TextView
+                    android:id="@+id/logLabel"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="LOG"
