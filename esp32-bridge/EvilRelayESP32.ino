@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 7h30th3r0n3. Part of Flipper-EvilRelay: https://github.com/7h30th3r0n3/Flipper-EvilRelay
 // EvilRelayESP32 — transport bridge for the EvilRelay Flipper FAP.
 //
 // Role: this ESP32 is cabled to the Flipper's USART (GPIO 13=TX / 14=RX) and
@@ -47,14 +49,21 @@ static const uint16_t TCP_PORT = 5566;
 #define RLY_T_IDENT 1
 #define RLY_T_REQ   2
 #define RLY_T_RESP  3
+#define RLY_T_STATUS 4             // bridge->Flipper: link/reader status (step feedback)
 #define RLY_CHUNK   230              // ESP-NOW payload per fragment (Evil RLY_CHUNK)
+
+// STATUS payload (1 byte) — lets the Flipper show the relay chain step by step.
+#define RLY_ST_BRIDGE_UP    0x01     // heartbeat: this ESP32 bridge is alive
+#define RLY_ST_READER_WIFI  0x02     // a phone reader connected over Wi-Fi/TCP
+#define RLY_ST_READER_NOW   0x03     // an Evil reader unit appeared over ESP-NOW
+#define RLY_ST_READER_LOST  0x04     // the connected reader went away
 
 #define PAYLOAD_MAX 512
 #define UART_FRAME_MAX (5 + PAYLOAD_MAX)
 
 #define RLY_TRACE 0                  // 1 = print frame flow on USB serial (bring-up)
 static const char* typeName(uint8_t t){
-  switch(t){ case RLY_T_IDENT:return "IDENT"; case RLY_T_REQ:return "REQ"; case RLY_T_RESP:return "RESP"; default:return "?"; }
+  switch(t){ case RLY_T_IDENT:return "IDENT"; case RLY_T_REQ:return "REQ"; case RLY_T_RESP:return "RESP"; case RLY_T_STATUS:return "STATUS"; default:return "?"; }
 }
 static void trace(const char* dir, uint8_t type, uint8_t seq, uint16_t len){
 #if RLY_TRACE
@@ -67,20 +76,21 @@ static void trace(const char* dir, uint8_t type, uint8_t seq, uint16_t len){
 // ---- state ----------------------------------------------------------------
 WiFiServer tcpServer(TCP_PORT);
 WiFiClient tcpClient;
-
-// Captive "app-opener": while no reader is connected, the AP answers the phone's
-// connectivity probe with a page linking to evilrelay://relay (opens the app);
-// once a reader (TCP client) is connected it answers 204 so Android marks the
-// network "validated" and stops offering to switch to mobile data.
-static DNSServer dnsServer;
-WiFiServer captive(80);
-static const uint16_t DNS_PORT = 53;
 static uint8_t  bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 static bool     espnowPeerSeen = false;
 
+// Captive "app-opener": while no reader is connected, the AP answers the phone's
+// connectivity probe with a page linking to evilrelay://relay (opens the app);
+// once a reader (TCP client) is connected it answers 204 so Android keeps the AP
+// and stops offering to switch to mobile data.
+static DNSServer dnsServer;
+WiFiServer captive(80);
+static const uint16_t DNS_PORT = 53;
+
 // ESP-NOW reassembly (one message in flight — half-duplex, like the Evil fw).
 static uint8_t  asmBuf[1024];
-static uint8_t  asmSeq = 0, asmType = 0, asmTotal = 0, asmHave = 0;
+static uint8_t  asmSeq = 0, asmType = 0, asmTotal = 0;
+static uint32_t asmMask = 0;              // bitmask of received fragment indices
 static uint16_t asmLen = 0;
 static volatile bool espnowMsgReady = false;
 static uint8_t  espnowMsgType = 0, espnowMsgSeq = 0;
@@ -101,6 +111,13 @@ static void sendToFlipper(uint8_t type, uint8_t seq, const uint8_t* p, uint16_t 
   FLIPPER_UART.write(hdr, 5);
   if(len) FLIPPER_UART.write(p, len);
   FLIPPER_UART.flush();
+}
+
+// One-byte STATUS frame to the Flipper, so its screen can show the relay chain
+// step by step (bridge up / reader connected / reader lost). Harmless to an older
+// FAP that ignores unknown frame types.
+static void sendStatusToFlipper(uint8_t code) {
+  sendToFlipper(RLY_T_STATUS, outSeq++, &code, 1);
 }
 
 static void sendToTcp(uint8_t type, uint8_t seq, const uint8_t* p, uint16_t len) {
@@ -152,19 +169,22 @@ static void onEspnowRecv(const uint8_t* mac, const uint8_t* data, int len) {
   espnowPeerSeen = true;
 
   if(seq != asmSeq || type != asmType) {  // new message
-    asmSeq = seq; asmType = type; asmTotal = ftot; asmHave = 0; asmLen = 0;
+    asmSeq = seq; asmType = type; asmTotal = ftot; asmMask = 0; asmLen = 0;
   }
   uint16_t off = (uint16_t)fidx * RLY_CHUNK;
-  if(off + plen <= sizeof(asmBuf)) {
+  if(fidx < 32 && !(asmMask & (1u << fidx)) && off + plen <= sizeof(asmBuf)) {
     memcpy(asmBuf + off, data + 6, plen);
     if(off + plen > asmLen) asmLen = off + plen;
-    asmHave++;
+    asmMask |= (1u << fidx);             // count distinct fragments, not packets
   }
-  if(asmHave >= asmTotal) {              // complete -> hand to main loop
-    espnowMsgType = type; espnowMsgSeq = seq; espnowMsgLen = asmLen;
-    memcpy(espnowMsg, asmBuf, asmLen);
-    espnowMsgReady = true;
-    asmSeq = (uint8_t)(seq + 1); asmHave = 0;  // force next to look new
+  uint32_t full = (asmTotal >= 32) ? 0xFFFFFFFFu : ((1u << asmTotal) - 1u);
+  if(asmTotal > 0 && asmMask == full) {  // all fragments present -> hand to main loop
+    if(!espnowMsgReady) {                // don't clobber a message the loop hasn't sent
+      espnowMsgType = type; espnowMsgSeq = seq; espnowMsgLen = asmLen;
+      memcpy(espnowMsg, asmBuf, asmLen);
+      espnowMsgReady = true;
+    }
+    asmSeq = (uint8_t)(seq + 1); asmMask = 0;  // force next to look new
   }
 }
 
@@ -204,6 +224,7 @@ static void pumpTcp() {
       tcpClient.setNoDelay(true);
       tcpHave = 0; tcpNeed = 0;
       Serial.println("[tcp] phone reader connected");
+      sendStatusToFlipper(RLY_ST_READER_WIFI);
     }
     return;
   }
@@ -226,34 +247,6 @@ static void pumpTcp() {
       tcpHave = 0; tcpNeed = 0;
     }
   }
-}
-
-// ---- captive portal (app-opener + fake-internet) --------------------------
-static void serveCaptive() {
-  dnsServer.processNextRequest();
-  WiFiClient hc = captive.available();
-  if(!hc) return;
-  // read (and discard) the HTTP request line; we answer the same for any path
-  uint32_t t0 = millis();
-  while(hc.connected() && millis() - t0 < 200) {
-    if(hc.available()) { char c = (char)hc.read(); if(c == '\n') break; }
-  }
-  bool linked = (tcpClient && tcpClient.connected());
-  if(linked) {
-    hc.print(F("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"));
-  } else {
-    static const char* body =
-      "<!doctype html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\">"
-      "<title>EvilRelay</title></head><body style=\"background:#111;color:#eee;font-family:sans-serif;text-align:center;padding-top:40px\">"
-      "<h2>EvilRelay</h2><p>Opening the app...</p>"
-      "<a href=\"evilrelay://relay\" style=\"display:inline-block;margin-top:20px;padding:14px 28px;background:#c0392b;color:#fff;border-radius:8px;text-decoration:none;font-size:18px\">Open EvilRelay</a>"
-      "<script>setTimeout(function(){try{window.location.href='evilrelay://relay';}catch(e){}},300);</script>"
-      "</body></html>";
-    hc.printf("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nContent-Length: %u\r\nConnection: close\r\n\r\n", (unsigned)strlen(body));
-    hc.print(body);
-  }
-  hc.flush();
-  hc.stop();
 }
 
 // ---- setup / loop ---------------------------------------------------------
@@ -286,6 +279,34 @@ void setup() {
   Serial.print("  IP "); Serial.print(WiFi.softAPIP());
   Serial.print("  TCP "); Serial.println(TCP_PORT);
   Serial.println("[bridge] ready — reader: phone(WiFi) or Evil-A(ESP-NOW) -> Flipper UART");
+  sendStatusToFlipper(RLY_ST_BRIDGE_UP);   // tell the Flipper the bridge is alive
+}
+
+// ---- captive portal (app-opener + fake-internet) --------------------------
+static void serveCaptive() {
+  dnsServer.processNextRequest();
+  WiFiClient hc = captive.available();
+  if(!hc) return;
+  uint32_t t0 = millis();
+  while(hc.connected() && millis() - t0 < 200) {
+    if(hc.available()) { char c = (char)hc.read(); if(c == '\n') break; }
+  }
+  bool linked = (tcpClient && tcpClient.connected());
+  if(linked) {
+    hc.print(F("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"));
+  } else {
+    static const char* body =
+      "<!doctype html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+      "<title>EvilRelay</title></head><body style=\"background:#111;color:#eee;font-family:sans-serif;text-align:center;padding-top:40px\">"
+      "<h2>EvilRelay</h2><p>Opening the app...</p>"
+      "<a href=\"evilrelay://relay\" style=\"display:inline-block;margin-top:20px;padding:14px 28px;background:#c0392b;color:#fff;border-radius:8px;text-decoration:none;font-size:18px\">Open EvilRelay</a>"
+      "<script>setTimeout(function(){try{window.location.href='evilrelay://relay';}catch(e){}},300);</script>"
+      "</body></html>";
+    hc.printf("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nContent-Length: %u\r\nConnection: close\r\n\r\n", (unsigned)strlen(body));
+    hc.print(body);
+  }
+  hc.flush();
+  hc.stop();
 }
 
 void loop() {
@@ -293,8 +314,25 @@ void loop() {
   pumpUart();
   pumpTcp();
   if(espnowMsgReady) {
-    espnowMsgReady = false;
-    trace("espnow->flip", espnowMsgType, espnowMsgSeq, espnowMsgLen);     // IDENT / RESP -> Flipper
-    sendToFlipper(espnowMsgType, espnowMsgSeq, espnowMsg, espnowMsgLen);
+    static uint8_t out[1024];
+    uint8_t  t = espnowMsgType, s = espnowMsgSeq;
+    uint16_t l = espnowMsgLen;
+    if(l > sizeof(out)) l = sizeof(out);
+    memcpy(out, espnowMsg, l);           // copy out before releasing the buffer
+    espnowMsgReady = false;              // now the recv callback may fill it again
+    trace("espnow->flip", t, s, l);      // IDENT / RESP -> Flipper
+    sendToFlipper(t, s, out, l);
   }
+
+  // Step-feedback to the Flipper screen: ~1 s bridge heartbeat, plus one-shot
+  // notices when a reader appears (Wi-Fi handled in pumpTcp) or drops.
+  static uint32_t lastHb = 0;
+  static bool espnowReported = false;
+  static bool tcpWasUp = false;
+  uint32_t now = millis();
+  if(now - lastHb >= 1000) { lastHb = now; sendStatusToFlipper(RLY_ST_BRIDGE_UP); }
+  if(espnowPeerSeen && !espnowReported) { espnowReported = true; sendStatusToFlipper(RLY_ST_READER_NOW); }
+  bool tcpUp = (tcpClient && tcpClient.connected());
+  if(tcpWasUp && !tcpUp) sendStatusToFlipper(RLY_ST_READER_LOST);
+  tcpWasUp = tcpUp;
 }
